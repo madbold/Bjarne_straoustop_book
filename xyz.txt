@@ -1,0 +1,318 @@
+"""
+import os
+import logging
+import threading
+import amb
+try:
+    import tkinter as tk
+    from tkinter import *
+    from tkinter import ttk
+    import tkinter.scrolledtext as ScrolledText
+    import tkinter.messagebox as tkMessageBox
+except:
+    import Tkinter as tk
+    from Tkinter import *
+    import ScrolledText
+    import tkMessageBox
+
+from FLongFormPDFCreator import FLongFormPDFCreator, RegisterWithAMB, extract_host_and_port
+from FLongFormPDFCreatorLogger import TextHandler, logger, logfile
+import FLongFormPDFCreatorLogger
+import FLongFormPDFCreatorQueue
+from pathlib import Path
+
+REGISTRATION_OBJ = None
+
+
+def to_tabular_format(lst_of_lst, header=None):
+    ''' This util function converts list of list to tabular data format
+    '''
+    if not header:
+        header = ['TOTAL_PROCESSED_REPORT_CONF_ID', 'SUCCESS_REPORT_CONF_ID', 'FAILED_REPORT_CONF_ID']
+    r_format = "{:^25}"*len(header)
+    h_format = r_format.format(*header)+'\n'
+    data = h_format
+    for lst in lst_of_lst:
+        data = data + r_format.format(*lst) + '\n'
+    return data
+
+
+class FLongFormPDFCreatorGUI(Tk):
+    """PDFCreator GUI class
+    """
+    def __init__(self):
+        '''Ctor
+        '''
+        super(FLongFormPDFCreatorGUI, self).__init__()
+        self._connection_status = 'NOT CONNECTED'
+        self._stop_event = None
+        self._amb_add = ''
+        self._unicode_mode = 'Unicode' if FLongFormPDFCreatorQueue.IS_UNICODE else 'Non-Unicode'
+        self._const_title_string = 'LongForm PDFCreator' + ' - ' + self._unicode_mode
+        self.title(' - '.join([self._const_title_string, self._connection_status]))
+        self.minsize(width=600, height=400)
+        self.resizable(width=True, height=True)
+        self.tabControl = ttk.Notebook(self)
+        self._tab1 = ttk.Frame(self.tabControl)
+        self._tab2 = ttk.Frame(self.tabControl)
+        self._tab3 = ttk.Frame(self.tabControl)
+
+        self.tabControl.add(self._tab1, text='Config')
+        self.tabControl.add(self._tab2, text='Status')
+        self.tabControl.add(self._tab3, text='Log')
+        self.tabControl.pack(expand=1, fill="both")
+        self._initialize_layout()
+
+    def _validate_input(self):
+        '''Validate user inputs
+        '''
+        chnl_name = self._amb_chn_input.get()
+        logger.debug('Validating channel name %s' % chnl_name)
+
+        if not chnl_name:
+            tkMessageBox.showerror('Error', 'Please enter valid AMB Channel Name')
+            logger.debug('Invalid channel name <%s> found.' % chnl_name)
+            return None
+
+        self._amb_add = self._amb_input.get()
+        amb_address = ''
+
+        amb_details = self._amb_add.split("/")
+        if len(amb_details) > 0 and amb_details[0]:
+            amb_address = amb_details[0]
+        if len(amb_details) > 1 and amb_details[1]:
+            ambUser = amb_details[1]
+        if len(amb_details) > 2 and amb_details[2]:
+            ambPassword = amb_details[2]
+
+        self._amb_input.delete(0, END)
+        self._amb_input.insert(0, str(amb_address))
+
+        if self._amb_add and len(self._amb_add.split(':')) == 2:
+            return self._amb_add, chnl_name
+        else:
+            tkMessageBox.showerror('Error', 'Please enter valid AMB address')
+            logger.debug('Invalid AMB address <%s> found .' % amb_address)
+        return None
+
+    @staticmethod
+    def _connect_and_start(parent, stop_event):
+        '''This runs as separate thread and perform conversion task
+        '''
+        call_once = False
+        global REGISTRATION_OBJ
+        logger.info('PDFCreator service is up and running now!')
+        while not stop_event.is_set():
+            if REGISTRATION_OBJ.is_amb_connected == 2:
+                if not call_once:
+                    parent.gui_callbacks(True)
+                    call_once = True
+                channel_id = REGISTRATION_OBJ.docx_reader_pdf_writer_channel_id
+                amb.mb_poll()
+                FLongFormPDFCreator().process_docx_data_from_amb(channel_id, parent)
+            else:
+                if call_once:
+                    parent.gui_callbacks(False)
+                REGISTRATION_OBJ.reconnect_amb()
+                call_once = False
+
+    def change_gui_state(self, conn_status_string, btn_txt, color):
+        ''' Change GUI state if any event occurs
+        '''
+        if btn_txt == 'Stop':
+            self._amb_input.configure(state=DISABLED)
+            self._loglocation.configure(state=DISABLED)
+            self._log_set_btn.configure(state=DISABLED)
+
+        elif btn_txt == 'Start':
+            self._amb_input.configure(state=NORMAL)
+            self._loglocation.configure(state=NORMAL)
+            self._log_set_btn.configure(state=NORMAL)
+        self._connection_status = conn_status_string
+        self.title(' - '.join([self._const_title_string, self._connection_status]))
+        self._connect_btn['text'] = btn_txt
+        self._amb_coonection_status['foreground'] = color
+        self._amb_coonection_status['text'] = self._connection_status
+
+    def gui_callbacks(self, conn_status):
+        '''Callback function called by child thread to update GUI
+        '''
+        if conn_status:
+            self.change_gui_state('CONNECTED with %s' % extract_host_and_port(self._amb_add), 'Stop', 'green')
+        else:
+            self.change_gui_state('AMB is down', 'Stop', 'red')
+
+    def request_completed(self, conf_id):
+        '''Callbacks function called by child thread after each conversion request completed
+        '''
+        if conf_id:
+            total_count = len(FLongFormPDFCreatorQueue.TOTAL_CONF_PROCESSED)
+            self._total_report_processed_value['text'] = total_count
+            failed_count = len(FLongFormPDFCreatorQueue.FAIL_CONF)
+            self._failed_report_processed_value['text'] = failed_count
+            self._last_processed_conf_value['text'] = str(conf_id)
+            data = [[str(FLongFormPDFCreatorQueue.TOTAL_CONF_PROCESSED),
+                    str(FLongFormPDFCreatorQueue.PASSED_CONF),
+                     str(FLongFormPDFCreatorQueue.FAIL_CONF)]]
+            logger.info('Summary of PDF generation so far.\n %s' % to_tabular_format(data))
+            logger.debug('Updated processed count for conf_id <%s>' % conf_id)
+
+    def set_log_file(self):
+        ''' Set log file location
+        '''
+        log_loc = self._loglocation.get()
+        if not log_loc:
+            tkMessageBox.showerror('Error', 'Please enter valid log folder')
+            return
+        if not os.path.isdir(log_loc):
+            tkMessageBox.showerror('Error', ' %s is not a valid directory.' % log_loc)
+            return
+
+        file_handler = None
+        old_file = ''
+        old_file_logger = None
+        log_path = os.path.join(log_loc, 'FLongFormPdfCreator_log.log').replace('\\\\', "\\")
+        for each_handler in logger.root.handlers:
+            if each_handler.__class__.__name__ == 'FileHandler':
+                old_file_logger = each_handler
+                old_file = old_file_logger.baseFilename
+                if old_file in [log_path]:
+                    file_handler = each_handler
+        if not file_handler:
+            try:
+                file_handler = logging.FileHandler(log_path)
+                # Add the handler to logger
+                if old_file_logger:
+                    logger.info("New logs will be written at %s " % log_path)
+                    logger.root.removeHandler(old_file_logger)
+                    logger.info("Removed old text file logger <%s>" % old_file)
+
+                formatter = logging.Formatter('%(asctime)s - %(levelname)s - %(name)s - %(message)s')
+                file_handler.setFormatter(formatter)
+                logger.root.addHandler(file_handler)
+
+                logger.info("Older logs can be found at %s " % old_file)
+                FLongFormPDFCreatorLogger.logfile = log_path
+                self.statusbar['text'] = 'Log location : ' + log_path
+                tkMessageBox.showinfo("Info", "Log location changed successfully")
+
+            except PermissionError as perr:
+                logger.exception("Permission exception occurred while adding logger")
+                tkMessageBox.showinfo("Info", "No permission to write log at %s" % log_path)
+
+            except Exception as err:
+                logger.exception("Exception occurred while adding logger.")
+        else:
+            tkMessageBox.showerror('Error', 'file %s is already set as log file.' % log_path)
+            logger.debug("log location <%s> already set.")
+
+    def open_log_file(self):
+        '''Open log file
+        '''
+        try:
+            os.startfile(FLongFormPDFCreatorLogger.logfile)
+        except Exception as err:
+            logger.error('Error occurred while opening log file. Error %r' % err)
+
+    def start_pdf_creator_handler(self):
+        '''Callback function triggered every time use click on button
+        '''
+        global REGISTRATION_OBJ
+        if self._connect_btn['text'] == 'Stop':
+            if REGISTRATION_OBJ.is_amb_connected == 2:
+                amb.mb_close()
+            self._stop_event.set()
+            self.change_gui_state('NOT CONNECTED', 'Start', 'red')
+            logger.info('PDFCreator service is stopped')
+        elif self._connect_btn['text'] == 'Start':
+            try:
+                result = self._validate_input()
+                if result:
+                    REGISTRATION_OBJ = RegisterWithAMB(result[0], result[1])
+                    REGISTRATION_OBJ.connect_amb_and_start_polling()
+                    if REGISTRATION_OBJ.is_amb_connected == 2:
+                        self._stop_event = threading.Event()
+                        worker_thread = threading.Thread(target=self._connect_and_start, args=(self, self._stop_event), daemon=True)
+                        worker_thread.start()
+            except Exception as err:
+                logger.exception('Error occurred while starting PDFCreator.Error is {0}'.format(err))
+                tkMessageBox.showerror('Error', 'Error occurred while starting PDFCreator. Please refer log.')
+
+    def _initialize_layout(self):
+        '''Ctor
+        '''
+        self._amb_chn_lbl = ttk.Label(self._tab1, text='AMB Channel')
+        self._amb_chn_lbl.grid(column=0, row=1, padx=5, pady=5, sticky='W')
+
+        self._amb_chn_input = ttk.Entry(self._tab1, width=40)
+        self._amb_chn_input.insert(0, 'FLF_PDF_READER_WRITER')
+        self._amb_chn_input.configure(state=DISABLED)
+        self._amb_chn_input.grid(column=1, row=1, padx=5, pady=5)
+
+        self._amb_coonection_status = ttk.Label(self._tab1, text=' NOT CONNECTED ', foreground="red")
+        self._amb_coonection_status.grid(column=4, row=2, columnspan=2, padx=5, pady=5)
+
+        self._amb_add_lbl = ttk.Label(self._tab1, text='AMB Address')
+        self._amb_add_lbl.grid(column=0, row=2, padx=5, pady=5, sticky='W')
+        self._amb_input = ttk.Entry(self._tab1, width=40)
+        self._amb_input.insert(0, 'localhost:9100')
+        self._amb_input.grid(column=1, row=2, padx=5, pady=5)
+
+        self._connect_btn = ttk.Button(self._tab1, text='Start', command=self.start_pdf_creator_handler)
+        self._connect_btn.grid(column=1, row=3, padx=5, pady=5)
+        self._tab1.rowconfigure((0, 1, 2, 3, 4, 5, 6, 7, 8), weight=1)
+
+        self._loglocation_lbl = ttk.Label(self._tab1, text='Log Location (Directory)')
+        self._loglocation_lbl.grid(column=0, row=0, padx=5, pady=5, sticky='SW')
+
+        self._loglocation = ttk.Entry(self._tab1, width=55)
+
+        dir_loc = Path(FLongFormPDFCreatorLogger.logfile).parent
+        self._loglocation.insert(0, dir_loc)
+        self._loglocation.grid(column=1, row=0, columnspan=6, padx=5, pady=5, sticky='SW')
+        self._log_set_btn = ttk.Button(self._tab1, text='Set', command=self.set_log_file)
+        self._log_set_btn.grid(column=6, row=0, padx=1, pady=1, sticky='SW')
+
+        self.statusbar = ttk.Label(self._tab1, text='Log location : ' + FLongFormPDFCreatorLogger.logfile, relief=FLAT, anchor=tk.W)
+
+        self.statusbar.grid(column=0, row=8, columnspan=6, ipadx=3, ipady=3, padx=5, pady=5, sticky='SW')
+
+        self._open_log_btn = ttk.Button(self._tab1, text='Open', command=self.open_log_file)
+        self._open_log_btn.grid(column=6, row=8, padx=1, pady=1, sticky='SW')
+
+        self._total_report_processed_lbl = ttk.Label(self._tab2, text='Total Report Processed')
+        self._total_report_processed_value = ttk.Label(self._tab2, text='0')
+        self._total_report_processed_lbl.grid(column=0, row=1, padx=5, pady=5, sticky ='sw')
+        self._total_report_processed_value.grid(column=1, row=1, padx=5, pady=5)
+
+        self._total_report_processed_value['text'] = len(FLongFormPDFCreatorQueue.TOTAL_CONF_PROCESSED)
+
+        self._failed_report_processed_lbl = ttk.Label(self._tab2, text='Total Failed Report')
+        self._failed_report_processed_value = ttk.Label(self._tab2, text='0')
+        self._failed_report_processed_lbl.grid(column=0, row=2, padx=5, pady=5, sticky ='sw')
+        self._failed_report_processed_value.grid(column=1, row=2, padx=5, pady=5)
+
+        self._failed_report_processed_value['text'] = len(FLongFormPDFCreatorQueue.FAIL_CONF)
+
+        self._last_processed_conf_lbl = ttk.Label(self._tab2, text='Last processed Confirmation')
+        self._last_processed_conf_value = ttk.Label(self._tab2, text='')
+        self._last_processed_conf_lbl.grid(column=0, row=3, padx=5, pady=5, sticky='sw')
+        self._last_processed_conf_value.grid(column=1, row=3, padx=5, pady=5)
+
+        self._logging_area = ScrolledText.ScrolledText(self._tab3, wrap=tk.WORD, state='disabled')
+        self._logging_area.configure(font='TkFixedFont')
+        self._logging_area.grid(column=0, row=0, columnspan=1)
+
+        text_handler = TextHandler(self._logging_area)
+        # Add the handler to logger
+        logger.root.addHandler(text_handler)
+        logger.info('PDFCreator GUI Layout is initialized successfully.')
+        logger.info('Log will be written at %s' % FLongFormPDFCreatorLogger.logfile)
+        # Remove console handler.
+        console_handler = None
+        for each_handler in logger.root.handlers:
+            if each_handler.__class__.__name__ == 'StreamHandler':
+                console_handler = each_handler
+        if console_handler:
+            logger.root.removeHandler(console_handler)
+"""
